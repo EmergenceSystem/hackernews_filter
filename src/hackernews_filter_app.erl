@@ -1,36 +1,58 @@
 %%%-------------------------------------------------------------------
-%%% @doc Hacker News search filter using the Algolia HN API.
+%%% @doc Hacker News search agent using the Algolia HN API.
 %%%
-%%% Searches stories, comments, jobs, Show HN and Ask HN posts
-%%% and returns them as embryo maps.
+%%% Announces capabilities to em_disco on startup and maintains a
+%%% memory of item URLs already returned so duplicate results across
+%%% successive queries are filtered out.
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(hackernews_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/2]).
 
 -define(ALGOLIA_URL, "http://hn.algolia.com/api/v1/search").
+
+-define(CAPABILITIES, [
+    <<"hackernews">>,
+    <<"tech_news">>,
+    <<"startups">>,
+    <<"programming">>,
+    <<"community">>
+]).
 
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    em_filter:start_filter(hackernews_filter, ?MODULE).
+    em_filter:start_agent(hackernews_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
-    em_filter:stop_filter(hackernews_filter).
+    em_filter:stop_agent(hackernews_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler
 %%====================================================================
 
-handle(Body) when is_binary(Body) ->
-    generate_embryo_list(Body);
-handle(_) ->
-    [].
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
 
 %%====================================================================
 %% Search and processing
@@ -89,10 +111,6 @@ atom_to_tag(job)     -> "job";
 atom_to_tag(show_hn) -> "show_hn";
 atom_to_tag(ask_hn)  -> "ask_hn".
 
-%%--------------------------------------------------------------------
-%% Response parsing
-%%--------------------------------------------------------------------
-
 parse_hits(JsonData, Type) ->
     try json:decode(JsonData) of
         #{<<"hits">> := Hits} when is_list(Hits) ->
@@ -102,20 +120,16 @@ parse_hits(JsonData, Type) ->
         _:_ -> []
     end.
 
-%%--------------------------------------------------------------------
-%% Per-type hit processing
-%%--------------------------------------------------------------------
-
 process_hit(Hit, story) ->
     case {maps:get(<<"objectID">>, Hit, undefined),
           maps:get(<<"title">>,    Hit, undefined)} of
         {Id, T} when is_binary(Id), is_binary(T) ->
-            Author  = maps:get(<<"author">>,       Hit, <<"unknown">>),
-            Points  = maps:get(<<"points">>,       Hit, 0),
-            Comments= maps:get(<<"num_comments">>, Hit, 0),
-            Url     = <<"https://news.ycombinator.com/item?id=", Id/binary>>,
-            Resume  = fmt("~ts [~p pts | ~p comments] by ~ts",
-                          [T, Points, Comments, Author]),
+            Author   = maps:get(<<"author">>,       Hit, <<"unknown">>),
+            Points   = maps:get(<<"points">>,       Hit, 0),
+            Comments = maps:get(<<"num_comments">>, Hit, 0),
+            Url      = <<"https://news.ycombinator.com/item?id=", Id/binary>>,
+            Resume   = fmt("~ts [~p pts | ~p comments] by ~ts",
+                           [T, Points, Comments, Author]),
             {true, embryo(Url, Resume)};
         _ -> false
     end;
@@ -123,11 +137,11 @@ process_hit(Hit, story) ->
 process_hit(Hit, comment) ->
     case maps:get(<<"objectID">>, Hit, undefined) of
         Id when is_binary(Id) ->
-            Author  = maps:get(<<"author">>,      Hit, <<"unknown">>),
-            StoryT  = maps:get(<<"story_title">>, Hit, <<"Untitled">>),
-            Text    = maps:get(<<"comment_text">>,Hit, <<>>),
+            Author  = maps:get(<<"author">>,       Hit, <<"unknown">>),
+            StoryT  = maps:get(<<"story_title">>,  Hit, <<"Untitled">>),
+            Text    = maps:get(<<"comment_text">>, Hit, <<>>),
             Preview = truncate(Text, 100),
-            StoryId = maps:get(<<"story_id">>,    Hit, undefined),
+            StoryId = maps:get(<<"story_id">>,     Hit, undefined),
             Url = case StoryId of
                 S when is_binary(S) ->
                     <<"https://news.ycombinator.com/item?id=", S/binary,
@@ -180,10 +194,6 @@ process_hit(Hit, ask_hn) ->
         _ -> false
     end.
 
-%%--------------------------------------------------------------------
-%% Helpers
-%%--------------------------------------------------------------------
-
 embryo(Url, Resume) ->
     #{<<"properties">> => #{<<"url">> => Url, <<"resume">> => Resume}}.
 
@@ -195,3 +205,7 @@ truncate(Bin, Max) when byte_size(Bin) > Max ->
     <<Part/binary, "...">>;
 truncate(Bin, _Max) ->
     Bin.
+
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.
