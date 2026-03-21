@@ -8,14 +8,16 @@
 %%%                 with scores, comment counts and author info.
 %%%
 %%%   hnrss.org   — live RSS feeds (frontpage, newest, best).
-%%%                 Catches very recent items not yet indexed by Algolia
-%%%                 and items that match the query in their title.
+%%%                 Catches very recent items not yet indexed by Algolia.
 %%%
 %%% Both sources run in parallel. Deduplication by URL is handled
-%%% upstream by emquest_handler, so both lists are returned as-is.
+%%% upstream by the Emquest pipeline.
 %%%
-%%% Handler contract: handle/2 (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: #{seen => #{binary_url => true}}.
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(hackernews_filter_app).
@@ -24,7 +26,7 @@
 -include_lib("xmerl/include/xmerl.hrl").
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
 -define(ALGOLIA_URL, "http://hn.algolia.com/api/v1/search").
 
@@ -38,13 +40,15 @@
 
 -define(ALGOLIA_TYPES, [story, comment, job, show_hn, ask_hn]).
 
--define(CAPABILITIES, [
-    <<"hackernews">>,
-    <<"tech_news">>,
-    <<"startups">>,
-    <<"programming">>,
-    <<"community">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"hackernews">>, <<"tech_news">>,
+                                      <<"startups">>, <<"programming">>,
+                                      <<"community">>].
 
 %%====================================================================
 %% Application behaviour
@@ -52,9 +56,9 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(hackernews_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
-    }).
+        capabilities => base_capabilities()
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(hackernews_filter).
@@ -64,14 +68,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -83,7 +80,6 @@ generate_embryo_list(JsonBinary) ->
     {Value, Timeout} = extract_params(JsonBinary),
     Parent = self(),
 
-    %% Spawn both sources concurrently.
     spawn(fun() ->
         Parent ! {algolia_results, search_algolia(Value, Timeout)}
     end),
@@ -91,8 +87,7 @@ generate_embryo_list(JsonBinary) ->
         Parent ! {rss_results, search_rss(Value, Timeout)}
     end),
 
-    %% Collect both results within the overall timeout.
-    DeadlineMs = erlang:system_time(millisecond) + Timeout * 1000,
+    DeadlineMs     = erlang:system_time(millisecond) + Timeout * 1000,
     AlgoliaResults = receive_results(algolia_results, DeadlineMs),
     RssResults     = receive_results(rss_results,     DeadlineMs),
 
@@ -108,7 +103,6 @@ receive_results(Tag, DeadlineMs) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            %% Accept both "value" and "query" keys for compatibility.
             Value   = binary_to_list(maps:get(<<"value">>, Map,
                           maps:get(<<"query">>, Map, <<"">>))),
             Timeout = case maps:get(<<"timeout">>, Map, undefined) of
@@ -183,7 +177,6 @@ process_hit(Hit, comment) ->
             StoryT  = maps:get(<<"story_title">>,  Hit, <<"Untitled">>),
             Text    = maps:get(<<"comment_text">>, Hit, <<>>),
             Preview = truncate(Text, 100),
-            %% story_id is an integer in the Algolia API response.
             Url = case maps:get(<<"story_id">>, Hit, undefined) of
                 S when is_integer(S) ->
                     SBin = integer_to_binary(S),
@@ -304,7 +297,6 @@ process_item(Item, Query) ->
 %% Shared helpers
 %%====================================================================
 
--spec embryo(binary(), binary()) -> map().
 embryo(Url, Resume) ->
     #{<<"properties">> => #{<<"url">> => Url, <<"resume">> => Resume}}.
 
@@ -319,7 +311,3 @@ truncate(Bin, _Max) ->
 
 xml_text([#xmlText{value = V} | _]) -> V;
 xml_text(_)                          -> "".
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
