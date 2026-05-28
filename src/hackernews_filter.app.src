@@ -1,15 +1,23 @@
 {application, hackernews_filter, [
     {description, "em_filter example for HackerNews via Algolia"},
-    {vsn, "0.1.0"},
-    {registered, []},
+    {vsn, "0.2.0"},
+    {registered, [hackernews_filter_sup, hackernews_filter_server]},
     {mod, {hackernews_filter_app, []}},
     {applications, [
         kernel,
         stdlib,
+        cowboy,
         em_filter
     ]},
-    {env, []},
-    {modules, []},
+    {env, [
+        {pop_port,   0},
+        {query_port, 0},
+        {pop_seeds,  []}
+    ]},
+    {modules, [
+        hackernews_filter_sup,
+        hackernews_filter_server
+    ]},
     {licenses, ["Apache-2.0"]},
     {links, [{"GitHub", "https://github.com/EmergenceSystem/hackernews_filter"}]}
 ]}.
